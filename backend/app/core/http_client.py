@@ -102,7 +102,6 @@ class RequestClient:
             return None
         return str(value)
 
-    """
     async def _fetch_once(
         self,
         url: str,
@@ -111,49 +110,17 @@ class RequestClient:
         device_profile: str,
         user_agent: str | None,
     ):
-        # Keep headers empty so tls_requests can auto-inject browser-matching UA/sec-ch-ua.
         timeout_seconds = max(1.0, float(settings.request_timeout_seconds))
-        _ = user_agent
         return await asyncio.to_thread(
             tls_requests.get,
             url,
+            headers=self._headers(device_profile, user_agent=user_agent),
             proxy=proxy_url,
             timeout=timeout_seconds,
             follow_redirects=True,
             client_identifier=self._tls_client_identifier(device_profile),
             verify=True,
         )
-    """
-
-    async def _fetch_once(
-        self,
-        url: str,
-        *,
-        proxy_url: str | None,
-        device_profile: str,
-        user_agent: str | None
-    ):
-        config = Config(browser_args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-blink-features",
-            "--disable-web-security",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--window-size=1,1",
-            "--window-position=0,0",
-            f"--app={url}",
-        ])
-        browser = await uc.start(config=config, user_data_dir=False, headless=False, proxy=None)
-        page = await browser.get(url)
-        # await page.sleep(30)
-        await page.select('#stickyHeader > div > a > img', timeout=30)
-        content = await page.get_content()
-        browser.stop()
-        return content
-    
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> float | None:
@@ -224,7 +191,6 @@ class RequestClient:
                     device_profile=normalized_profile,
                     user_agent=user_agent,
                 )
-                """
                 if response.status_code <= 0:
                     reason = (response.text or "TLS transport error").strip()
                     self.proxy_manager.mark_dead(proxy_url, reason=reason, url=url)
@@ -256,13 +222,18 @@ class RequestClient:
                     await asyncio.sleep(sleep_s)
                     continue
                 elif response.status_code >= 400:
-                    last_error = RuntimeError(f"HTTP {response.status_code}")
-                else:"""
+                    reason = f"HTTP {response.status_code}"
+                    self.proxy_manager.mark_dead(proxy_url, reason=reason, url=url)
+                    last_error = RuntimeError(reason)
+                    sleep_s = self._compute_backoff(attempt, blocked=False)
+                    await asyncio.sleep(sleep_s)
+                    continue
+
                 self.proxy_manager.mark_success(proxy_url)
                 return FetchResult(
-                    text=response,
-                    status_code=200,
-                    final_url=str(url),
+                    text=response.text,
+                    status_code=response.status_code,
+                    final_url=str(getattr(response, "url", url)),
                 )
             except (ProxyError, TLSError) as exc:
                 self.proxy_manager.mark_dead(proxy_url, reason=str(exc), url=url)
@@ -271,6 +242,9 @@ class RequestClient:
             except (HTTPError, OSError) as exc:
                 last_error = exc
                 logger.warning("TLS request failure for %s: %s", url, exc)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("Unexpected HTTP client failure for %s via proxy=%s: %s", url, proxy_url, exc)
 
             sleep_s = self._compute_backoff(attempt, blocked=False)
             await asyncio.sleep(sleep_s)

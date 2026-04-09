@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "Smart Catalog"
     debug: bool = False
+    log_level: str = "INFO"
 
     cors_origins: list[str] = [
         "http://localhost:5173",

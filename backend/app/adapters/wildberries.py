@@ -23,7 +23,7 @@ from app.adapters.common import (
     looks_like_product_title,
     normalize_link,
 )
-from app.adapters.fallback_playwright import render_page
+from app.adapters.fallback_nodriver import render_page
 from app.core.config import settings
 from app.core.http_client import RequestClient
 from app.schemas.models import ProductCard, ProductDetail, SourceName
@@ -57,7 +57,7 @@ class WildberriesAdapter(MarketplaceAdapter):
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
 
-        cards = await self._search_with_playwright(
+        cards = await self._search_with_selenium(
             url=url,
             limit=limit,
             device_profile=profile,
@@ -66,7 +66,7 @@ class WildberriesAdapter(MarketplaceAdapter):
         if cards:
             return cards[:limit]
 
-        logger.warning("Wildberries Playwright search returned no cards, trying HTTP fallback: %s", url)
+        logger.warning("Wildberries Selenium search returned no cards, trying HTTP fallback: %s", url)
         try:
             html = await self.client.fetch_text(
                 url,
@@ -89,7 +89,7 @@ class WildberriesAdapter(MarketplaceAdapter):
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
 
-        detail = await self._detail_with_playwright(
+        detail = await self._detail_with_selenium(
             full_url,
             device_profile=profile,
             user_agent=user_agent,
@@ -97,7 +97,7 @@ class WildberriesAdapter(MarketplaceAdapter):
         if detail and detail.title:
             return detail
 
-        logger.warning("Wildberries Playwright detail parse incomplete, trying HTTP fallback: %s", full_url)
+        logger.warning("Wildberries Selenium detail parse incomplete, trying HTTP fallback: %s", full_url)
         html = await self.client.fetch_text(
             full_url,
             source=self.source.value,
@@ -109,7 +109,7 @@ class WildberriesAdapter(MarketplaceAdapter):
             return fallback_detail
         raise RuntimeError("Failed to parse Wildberries product details")
 
-    async def _search_with_playwright(
+    async def _search_with_selenium(
         self,
         url: str,
         limit: int,
@@ -165,7 +165,7 @@ class WildberriesAdapter(MarketplaceAdapter):
                 logger.warning("Wildberries parse produced 0 cards, attempt=%s url=%s", attempt, url)
             except Exception as exc:  # noqa: BLE001
                 self.client.proxy_manager.mark_dead(proxy_url, reason=f"playwright search failed: {exc}", url=url)
-                logger.warning("Wildberries Playwright search failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
+                logger.warning("Wildberries Selenium search failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
 
             await asyncio.sleep(settings.retry_backoff_seconds * attempt)
 
@@ -173,7 +173,7 @@ class WildberriesAdapter(MarketplaceAdapter):
             raise RuntimeError(f"Wildberries blocked by anti-bot challenge: {self.last_block_reason}")
         return []
 
-    async def _detail_with_playwright(
+    async def _detail_with_selenium(
         self,
         full_url: str,
         device_profile: str,
@@ -203,7 +203,7 @@ class WildberriesAdapter(MarketplaceAdapter):
                     reason=f"playwright detail failed: {exc}",
                     url=full_url,
                 )
-                logger.warning("Wildberries Playwright detail failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
+                logger.warning("Wildberries Selenium detail failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
 
             await asyncio.sleep(settings.retry_backoff_seconds * attempt)
 

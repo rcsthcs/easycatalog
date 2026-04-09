@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from urllib.parse import quote_plus, urljoin
 
 from bs4 import BeautifulSoup
@@ -23,7 +24,7 @@ from app.adapters.common import (
     looks_like_product_title,
     normalize_link,
 )
-from app.adapters.fallback_playwright import render_page
+from app.adapters.fallback_nodriver import render_page
 from app.core.config import settings
 from app.core.http_client import RequestClient
 from app.schemas.models import ProductCard, ProductDetail, SourceName
@@ -60,17 +61,23 @@ class OzonAdapter(MarketplaceAdapter):
         url = f"{self.base_url}/search/?text={quote_plus(query)}"
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
+        self.last_block_reason = None
 
-        cards = await self._search_with_playwright(
-            url=url,
-            limit=limit,
-            device_profile=profile,
-            user_agent=user_agent,
-        )
+        try:
+            cards = await self._search_with_selenium(
+                url=url,
+                limit=limit,
+                device_profile=profile,
+                user_agent=user_agent,
+            )
+        except RuntimeError as exc:
+            logger.warning("Ozon Selenium search exhausted, trying HTTP fallback: %s", exc)
+            cards = []
+
         if cards:
             return cards[:limit]
 
-        logger.warning("Ozon Playwright search returned no cards, trying HTTP fallback: %s", url)
+        logger.warning("Ozon Selenium search returned no cards, trying HTTP fallback: %s", url)
         try:
             html = await self.client.fetch_text(
                 url,
@@ -93,7 +100,7 @@ class OzonAdapter(MarketplaceAdapter):
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
 
-        detail = await self._detail_with_playwright(
+        detail = await self._detail_with_selenium(
             full_url,
             device_profile=profile,
             user_agent=user_agent,
@@ -101,7 +108,7 @@ class OzonAdapter(MarketplaceAdapter):
         if detail and detail.title:
             return detail
 
-        logger.warning("Ozon Playwright detail parse incomplete, trying HTTP fallback: %s", full_url)
+        logger.warning("Ozon Selenium detail parse incomplete, trying HTTP fallback: %s", full_url)
         html = await self.client.fetch_text(
             full_url,
             source=self.source.value,
@@ -113,7 +120,7 @@ class OzonAdapter(MarketplaceAdapter):
             return fallback_detail
         raise RuntimeError("Failed to parse Ozon product details")
 
-    async def _search_with_playwright(
+    async def _search_with_selenium(
         self,
         url: str,
         limit: int,
@@ -169,15 +176,13 @@ class OzonAdapter(MarketplaceAdapter):
                 logger.warning("Ozon parse produced 0 cards, attempt=%s url=%s", attempt, url)
             except Exception as exc:  # noqa: BLE001
                 self.client.proxy_manager.mark_dead(proxy_url, reason=f"playwright search failed: {exc}", url=url)
-                logger.warning("Ozon Playwright search failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
+                logger.warning("Ozon Selenium search failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
 
             await asyncio.sleep(settings.retry_backoff_seconds * attempt)
 
-        if self.last_block_reason:
-            raise RuntimeError(f"Ozon blocked by anti-bot challenge: {self.last_block_reason}")
         return []
 
-    async def _detail_with_playwright(
+    async def _detail_with_selenium(
         self,
         full_url: str,
         device_profile: str,
@@ -207,7 +212,7 @@ class OzonAdapter(MarketplaceAdapter):
                     reason=f"playwright detail failed: {exc}",
                     url=full_url,
                 )
-                logger.warning("Ozon Playwright detail failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
+                logger.warning("Ozon Selenium detail failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
 
             await asyncio.sleep(settings.retry_backoff_seconds * attempt)
 
@@ -389,11 +394,25 @@ class OzonAdapter(MarketplaceAdapter):
         )
 
     def _extract_price(self, container: BeautifulSoup | None, blob_text: str) -> str | None:
+        def clean_installments(t: str | None) -> str | None:
+            if not t: return t
+            t = re.sub(
+                r"\d[\d\s\xa0]*(?:₸|тг|₽|руб|тенге)\s*(?:[xх×]\s*\d+\s*мес|в\s*месяц|в\s*рассрочку|рассрочк|за\s*мес)",
+                "", t, flags=re.IGNORECASE
+            )
+            t = re.sub(
+                r"(?:[xх×]\s*\d+\s*мес|в\s*месяц|в\s*рассрочку|рассрочк|за\s*мес)\s*\d[\d\s\xa0]*(?:₸|тг|₽|руб|тенге)",
+                "", t, flags=re.IGNORECASE
+            )
+            return t
+
+        clean_blob = clean_installments(blob_text) or ""
+
         candidates: list[str | None] = []
         if container:
             candidates.extend(
                 [
-                    first_text(
+                    clean_installments(first_text(
                         container,
                         [
                             "[class*='price']",
@@ -401,18 +420,20 @@ class OzonAdapter(MarketplaceAdapter):
                             "strong",
                             "ins",
                         ],
-                    ),
+                    )),
                     first_attr(container, ["meta[itemprop='price']"], "content"),
                 ]
             )
 
-        if any(token in blob_text.lower() for token in ("₸", "₽", "тг", "тенге", "руб")):
-            candidates.append(blob_text)
+        if any(token in clean_blob.lower() for token in ("₸", "₽", "тг", "тенге", "руб")):
+            candidates.append(clean_blob)
 
         for candidate in candidates:
             price = format_price(candidate)
             if price:
                 return price
+                
+        logger.debug(f"NO PRICE FOUND. base: '{blob_text}', cleaned: '{clean_blob}', cands: {candidates}")
         return None
 
     def _extract_rating(self, container: BeautifulSoup | None, blob_text: str) -> str | None:
