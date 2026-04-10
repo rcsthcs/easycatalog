@@ -1,3 +1,4 @@
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,7 +28,9 @@ class Settings(BaseSettings):
     enable_block_telemetry: bool = True
 
     enable_playwright_fallback: bool = True
-    apify_api_key: str = ""
+    apify_api_key: str = Field(default="", validation_alias=AliasChoices("APIFY_API_KEY", "APIFY_TOKEN"))
+    apify_ozon_actor_id: str = "zen-studio/ozon-scraper-pro"
+    apify_wildberries_actor_id: str = "akoinc/wb-card-parser"
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -97,22 +97,24 @@ class WildberriesAdapter(MarketplaceAdapter):
         full_url = urljoin(self.base_url, product_url)
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
-        
+
         apify_detail = None
         article_id = None
+        apify_api_key = settings.apify_api_key.strip()
         import re
         match = re.search(r'(?:catalog/|/)(\d+)(?:/detail\.aspx)?', full_url)
-        if match:
+        if match and apify_api_key:
             article_id = match.group(1)
             try:
                 from apify_client import ApifyClientAsync
-                client = ApifyClientAsync(settings.apify_api_key)
+
+                client = ApifyClientAsync(apify_api_key)
                 run_input = {
                     "articleId": article_id,
                     "proxyServer": {"useApifyProxy": True}
                 }
                 logger.info("Starting Apify task for WB: %s", article_id)
-                run = await client.actor("akoinc/wb-card-parser").call(run_input=run_input)
+                run = await client.actor(settings.apify_wildberries_actor_id).call(run_input=run_input)
                 dataset = await client.dataset(run["defaultDatasetId"]).list_items()
                 items = dataset.items
                 if items and "result" in items[0]:
@@ -129,6 +131,9 @@ class WildberriesAdapter(MarketplaceAdapter):
                     }
             except Exception as exc:
                 logger.warning("Apify failed for WB, %s", exc)
+        elif match:
+            article_id = match.group(1)
+            logger.info("APIFY_API_KEY is empty, skipping Apify for Wildberries detail")
 
         detail = await self._detail_with_selenium(
             full_url,
