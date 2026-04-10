@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     enable_block_telemetry: bool = True
 
     enable_playwright_fallback: bool = True
+    apify_api_key: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

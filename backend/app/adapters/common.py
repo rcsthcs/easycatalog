@@ -18,13 +18,13 @@ RATING_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 RATING_WITH_SCALE_RE = re.compile(r"(?<!\d)([1-5](?:[\.,]\d{1,2})?)\s*(?:/\s*5|из\s*5|★)", re.IGNORECASE)
-RATING_BOUNDED_RE = re.compile(r"(?<!\d)([1-5](?:[\.,]\d{1,2})?)(?!\d)")
+RATING_BOUNDED_RE = re.compile(r"(?<![\d\.,])([1-5](?:[\.,]\d{1,2})?)(?![\d\.,])")
 REVIEWS_RE = re.compile(
-    r"(\d[\d\s\xa0]*)\s*(?:отзыв(?:а|ов)?|оцен(?:ка|ки|ок)|review(?:s)?)",
+    r"(?<![\.,\d])(\d+[\d\s\xa0]*)\s*(?:отзыв(?:а|ов)?|оцен(?:ка|ки|ок)?|review(?:s)?)",
     re.IGNORECASE,
 )
 REVIEWS_PREFIX_RE = re.compile(
-    r"(?:отзыв(?:ы|ов|а)?|review(?:s)?|оцен(?:ка|ки|ок)?)\s*[\(\[\s:]*\s*(\d[\d\s\xa0]*)",
+    r"(?:отзыв(?:ы|ов|а)?|review(?:s)?|оцен(?:ка|ки|ок)?)\s*[\(\[\s:]*\s*(?<![\.,\d])(\d+[\d\s\xa0]*)",
     re.IGNORECASE,
 )
 AD_KEYWORDS = (
@@ -71,6 +71,7 @@ ANTIBOT_MARKERS = (
     "доступ ограничен",
     "нам нужно убедиться, что вы не робот",
     "please, enable javascript to continue",
+    "ой... кажется, такой страницы не существует",
     "captcha",
     "access denied",
     "forbidden",
@@ -182,8 +183,8 @@ def format_rating(value: str | None) -> str | None:
     match = RATING_CONTEXT_RE.search(text)
     if not match:
         match = RATING_WITH_SCALE_RE.search(text)
-    if not match and ("★" in text or "рейтинг" in text.lower() or "rating" in text.lower()):
-        match = RATING_BOUNDED_RE.search(text)
+    if not match and ("★" in text or "рейтинг" in text.lower() or "rating" in text.lower() or "оцен" in text.lower() or "отзыв" in text.lower()):
+        match = RATING_BOUNDED_RE.search(text.replace("4K", "").replace("5G", ""))
     if not match:
         return None
 
@@ -213,9 +214,11 @@ def extract_reviews_count(value: str | None) -> str | None:
 
     lowered = text.lower()
     if any(token in lowered for token in ("отзыв", "оцен", "review")):
-        numeric = re.sub(r"\D", "", text)
-        if 1 <= len(numeric) <= 6:
-            return numeric
+        tokens = text.split()
+        for token in reversed(tokens):
+            numeric = re.sub(r"\D", "", token)
+            if 1 <= len(numeric) <= 6:
+                return numeric
 
     return None
 

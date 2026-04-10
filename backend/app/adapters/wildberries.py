@@ -35,11 +35,20 @@ class WildberriesAdapter(MarketplaceAdapter):
     source = SourceName.wildberries
     base_url = "https://www.wildberries.ru"
     search_wait_selectors = [
-        "a[href*='/catalog/'][href*='detail.aspx']",
-        "article",
-        "main",
+        "article.product-card",
+        ".product-card__wrapper",
     ]
-    detail_wait_selectors = ["h1", "[class*='price']", "main"]
+    detail_wait_selectors = [
+        "h1[class*='product-page']",
+        "[class*='product-title']",
+        "h2[class*='productTitle']",  # New SPA hash class
+        "ins[class*='price-block__final-price']",
+        "ins[class*='priceBlockFinalPrice']",  # New SPA Hash class
+        "div[class*='product-page__slider']",
+        "div[class*='productPageSlider']",
+        "ul.product-params__list",
+        "table.table--CGApj",  # Table from new SPA
+    ]
 
     def __init__(self, client: RequestClient):
         self.client = client
@@ -88,25 +97,88 @@ class WildberriesAdapter(MarketplaceAdapter):
         full_url = urljoin(self.base_url, product_url)
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
+        
+        apify_detail = None
+        article_id = None
+        import re
+        match = re.search(r'(?:catalog/|/)(\d+)(?:/detail\.aspx)?', full_url)
+        if match:
+            article_id = match.group(1)
+            try:
+                from apify_client import ApifyClientAsync
+                client = ApifyClientAsync(settings.apify_api_key)
+                run_input = {
+                    "articleId": article_id,
+                    "proxyServer": {"useApifyProxy": True}
+                }
+                logger.info("Starting Apify task for WB: %s", article_id)
+                run = await client.actor("akoinc/wb-card-parser").call(run_input=run_input)
+                dataset = await client.dataset(run["defaultDatasetId"]).list_items()
+                items = dataset.items
+                if items and "result" in items[0]:
+                    res = items[0]["result"]
+                    attributes = {}
+                    for opt in res.get("options", []):
+                        if "name" in opt and "value" in opt:
+                            attributes[opt["name"]] = str(opt["value"])
+                            
+                    apify_detail = {
+                        "title": res.get("imt_name", ""),
+                        "description": res.get("description", ""),
+                        "characteristics": attributes,
+                    }
+            except Exception as exc:
+                logger.warning("Apify failed for WB, %s", exc)
 
         detail = await self._detail_with_selenium(
             full_url,
             device_profile=profile,
             user_agent=user_agent,
         )
+        
+        if not (detail and detail.title):
+            logger.warning("Wildberries Selenium detail parse incomplete, trying HTTP fallback: %s", full_url)
+            html = await self.client.fetch_text(
+                full_url,
+                source=self.source.value,
+                device_profile=profile,
+                user_agent=user_agent,
+            )
+            detail = self._parse_detail(html.text, full_url)
+            
+        if detail and apify_detail:
+            detail.characteristics = apify_detail.get("characteristics") or detail.characteristics
+            detail.description = apify_detail.get("description") or detail.description
+            if not detail.title:
+                detail.title = apify_detail.get("title") or detail.title
+
+        # Resolving image issue (-BUttZw82auVosRru2) manually since Apify WB card parser doesn't return image URLs
+        if detail and article_id and not detail.image_url:
+            nm_id = int(article_id)
+            vol = nm_id // 100000
+            part = nm_id // 1000
+            basket = "01"
+            if 0 <= vol <= 143: basket = "01"
+            elif 144 <= vol <= 287: basket = "02"
+            elif 288 <= vol <= 431: basket = "03"
+            elif 432 <= vol <= 719: basket = "04"
+            elif 720 <= vol <= 1007: basket = "05"
+            elif 1008 <= vol <= 1061: basket = "06"
+            elif 1062 <= vol <= 1115: basket = "07"
+            elif 1116 <= vol <= 1169: basket = "08"
+            elif 1170 <= vol <= 1313: basket = "09"
+            elif 1314 <= vol <= 1601: basket = "10"
+            elif 1602 <= vol <= 1655: basket = "11"
+            elif 1656 <= vol <= 1919: basket = "12"
+            elif 1920 <= vol <= 2045: basket = "13"
+            elif 2046 <= vol <= 2189: basket = "14"
+            elif 2190 <= vol <= 2405: basket = "15"
+            else: basket = "16"
+            detail.image_url = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
+
         if detail and detail.title:
             return detail
 
-        logger.warning("Wildberries Selenium detail parse incomplete, trying HTTP fallback: %s", full_url)
-        html = await self.client.fetch_text(
-            full_url,
-            source=self.source.value,
-            device_profile=profile,
-            user_agent=user_agent,
-        )
-        fallback_detail = self._parse_detail(html.text, full_url)
-        if fallback_detail and fallback_detail.title:
-            return fallback_detail
         raise RuntimeError("Failed to parse Wildberries product details")
 
     async def _search_with_selenium(
@@ -127,7 +199,7 @@ class WildberriesAdapter(MarketplaceAdapter):
                     proxy_url=proxy_url,
                     scroll=True,
                     device_profile=device_profile,
-                    user_agent=user_agent,
+                    user_agent=None,  # Do not override UA for nodriver to prevent Cloudflare blocks
                 )
                 blocked_by = detect_antibot_challenge(rendered)
                 if blocked_by:
@@ -190,8 +262,19 @@ class WildberriesAdapter(MarketplaceAdapter):
                     proxy_url=proxy_url,
                     scroll=True,
                     device_profile=device_profile,
-                    user_agent=user_agent,
+                    user_agent=None,  # Do not override UA for nodriver as it triggers Cloudflare
                 )
+                blocked_by = detect_antibot_challenge(rendered)
+                if blocked_by:
+                    self.last_block_reason = blocked_by
+                    self.client.proxy_manager.mark_dead(
+                        proxy_url,
+                        reason=f"anti-bot challenge: {blocked_by}",
+                        url=full_url,
+                    )
+                    logger.warning("Wildberries Selenium blocked (%s) on detail %s", blocked_by, full_url)
+                    continue
+
                 detail = self._parse_detail(rendered, full_url)
                 self.client.proxy_manager.mark_success(proxy_url)
                 if detail.title:
@@ -300,16 +383,25 @@ class WildberriesAdapter(MarketplaceAdapter):
         title = choose_first_non_empty(
             [
                 jsonld.get("title"),
-                first_text(soup, ["h1", "[class*='product-page__title']", "[class*='product-title']"]),
+                first_text(soup, ["h1", "h2[class*='productTitle']", "[class*='product-page__title']", "[class*='product-title']"]),
             ]
         ) or ""
 
         image_url = choose_first_non_empty(
             [
                 jsonld.get("image_url"),
-                first_attr(soup, ["meta[property='og:image']"], "content"),
-                first_attr(soup, ["[class*='swiper'] img[src]", "img[src]"], "src"),
+                first_attr(
+                    soup,
+                    [
+                        "div[class*='productPageSlider'] img[src]",
+                        "div.product-page__slider img[src]",
+                        "div.zoom-image-container img[src]",
+                        "[class*='swiper'] img[src]",
+                    ],
+                    "src",
+                ),
                 first_attr(soup, ["img[data-src]"], "data-src"),
+                first_attr(soup, ["meta[property='og:image']"], "content"),
             ]
         )
         image_url = normalize_link(self.base_url, image_url) if image_url else None
@@ -320,6 +412,7 @@ class WildberriesAdapter(MarketplaceAdapter):
                 first_text(
                     soup,
                     [
+                        "ins[class*='priceBlockFinalPrice']",
                         "[class*='price-block'] [class*='price']",
                         "[class*='final-price']",
                         "[class*='price']",
@@ -350,16 +443,16 @@ class WildberriesAdapter(MarketplaceAdapter):
         description = choose_first_non_empty(
             [
                 jsonld.get("description"),
-                first_text(soup, ["[class*='description']", "[class*='product-page__description']"]),
+                first_text(soup, ["div[class*='productDescription']", "div[class*='product-page__description']", "section[class*='description']"]),
                 first_attr(soup, ["meta[name='description']"], "content"),
             ]
         )
 
         characteristics = gather_key_value(
             soup,
-            row_selector="tr, li, [class*='charc'], [class*='option'], [class*='specification']",
-            key_selector="th, [class*='name'], [class*='title']",
-            value_selector="td, [class*='value'], [class*='text']",
+            row_selector="tr, li, [class*='charc'], [class*='option'], [class*='specification'], [class*='product-params__row']",
+            key_selector="th, [class*='name'], [class*='title'], [class*='product-params__cell-title']",
+            value_selector="td, [class*='value'], [class*='text'], [class*='product-params__cell']:not([class*='product-params__cell-title'])",
         )
 
         raw_sections = {
@@ -436,6 +529,7 @@ class WildberriesAdapter(MarketplaceAdapter):
                 [
                     first_text(container, ["[class*='feedbacks']", "[class*='reviews']", "[class*='comment']"]),
                     first_attr(container, ["[aria-label*='отзыв']"], "aria-label"),
+                    first_text(container, ["[class*='address-rate']"]),
                 ]
             )
         candidates.append(blob_text)

@@ -97,6 +97,82 @@ class OzonAdapter(MarketplaceAdapter):
 
     async def get_product_details(self, product_url: str) -> ProductDetail:
         full_url = urljoin(self.base_url, product_url)
+        
+        try:
+            # Using Apify as requested
+            from apify_client import ApifyClientAsync
+            client = ApifyClientAsync(settings.apify_api_key)
+            run_input = {
+                "startUrls": [{"url": full_url}],
+            }
+            logger.info("Starting Apify task for Ozon: %s", full_url)
+            run = await client.actor("zen-studio/ozon-scraper-pro").call(run_input=run_input)
+            dataset = await client.dataset(run["defaultDatasetId"]).list_items()
+            items = dataset.items
+            
+            if items:
+                item = items[0]
+                title = item.get("title", "")
+                
+                # Check multiple price fields and avoid zero-balance outputs
+                price = str(item.get("cardPrice") or item.get("price") or item.get("originalPrice") or "")
+                
+                # Format price
+                if price and "₽" not in price:
+                    price = price.replace("\u2009", "").replace(" ", "").strip() + " ₽"
+                elif price:
+                    price = price.replace("\u2009", " ")
+                    
+                rating = str(item.get("rating") or "")
+                reviews_count = str(item.get("reviewCount") or "").replace("\xa0", " ")
+                
+                # Fetch first image
+                image_url = item.get("images", [None])[0] if item.get("images") else ""
+                if not image_url and item.get("descriptionImages"):
+                    image_url = item.get("descriptionImages")[0]
+                    
+                description = item.get("richDescription") or item.get("description") or ""
+                brand = item.get("brand") or ""
+                
+                # Fetch variants
+                variants_list = []
+                for var_group in item.get("variants", []):
+                    group_name = var_group.get("aspectName", "Вариант")
+                    options = var_group.get("options", [])
+                    var_options = [opt.get("name", "") for opt in options if opt.get("name")]
+                    if var_options:
+                        variants_list.append({
+                            "name": group_name,
+                            "options": var_options
+                        })
+
+                characteristics = item.get("characteristics", [])
+                attributes = {char.get("name", ""): char.get("value", "") for char in characteristics}
+                if brand and "Бренд" not in attributes.keys():
+                    attributes["Бренд"] = brand
+                
+                # We can store variants in characteristics for now or pass to a new field if frontend supports it
+                # For maximum compatibility with frontend table, we inject available variants into characteristics.
+                if variants_list:
+                    attributes["Доступные варианты"] = "; ".join(
+                        f"{v['name']}: {', '.join(v['options'])}" for v in variants_list
+                    )
+                
+                if title:
+                    return ProductDetail(
+                        source=self.source,
+                        title=title,
+                        product_url=full_url,
+                        price=price,
+                        rating=rating,
+                        reviews_count=reviews_count,
+                        image_url=image_url,
+                        description=description,
+                        characteristics=attributes,
+                    )
+        except Exception as exc:
+            logger.warning("Apify failed, falling back to original code: %s", exc)
+
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
 
