@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     apify_ozon_actor_id: str = "zen-studio/ozon-scraper-pro"
     apify_wildberries_actor_id: str = "akoinc/wb-card-parser"
 
+    capmonster_api_key: str = Field(default="", validation_alias=AliasChoices("CAPMONSTER_API_KEY", "CAPMONSTER_KEY"))
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

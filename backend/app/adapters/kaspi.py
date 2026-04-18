@@ -15,6 +15,8 @@ from app.adapters.common import (
     extract_product_jsonld,
     extract_rating_from_class_tokens,
     extract_reviews_count,
+    extract_seller,
+    extract_total_results_count,
     first_attr,
     first_text,
     format_price,
@@ -46,6 +48,8 @@ class KaspiAdapter(MarketplaceAdapter):
     def __init__(self, client: RequestClient):
         self.client = client
         self.last_block_reason: str | None = None
+        self.last_search_total_found: int | None = None
+        self.last_search_sellers: list[str] = []
 
     @staticmethod
     def _resolve_device_profile() -> str:
@@ -220,6 +224,8 @@ class KaspiAdapter(MarketplaceAdapter):
         url = f"{self.base_url}/shop/search/?text={quote_plus(query)}"
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
+        self.last_search_total_found = None
+        self.last_search_sellers = []
         
         timeout_ms = int((settings.request_timeout_seconds + 12) * 1000)
         proxy_url = self.client.proxy_manager.next_proxy()
@@ -234,7 +240,24 @@ class KaspiAdapter(MarketplaceAdapter):
                 device_profile=profile,
                 user_agent=user_agent,
             )
-            return self._parse_cards(rendered, limit)
+            cards = self._parse_cards(rendered, limit)
+
+            # If the rendered DOM does not expose global count, try raw HTML once.
+            if self.last_search_total_found is None:
+                try:
+                    html = await self.client.fetch_text(
+                        url,
+                        source=self.source.value,
+                        device_profile=profile,
+                        user_agent=user_agent,
+                    )
+                    parsed_total = extract_total_results_count(html.text)
+                    if parsed_total is not None:
+                        self.last_search_total_found = parsed_total
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Kaspi total count fallback fetch failed: %s", exc)
+
+            return cards
         except Exception as exc:  # noqa: BLE001
             logger.warning("Kaspi HTTP request failed: %s", exc)
             if self.last_block_reason:
@@ -289,6 +312,7 @@ class KaspiAdapter(MarketplaceAdapter):
                 {
                     "title": None,
                     "price": None,
+                    "seller": None,
                     "rating": None,
                     "reviews_count": None,
                     "image_url": None,
@@ -317,6 +341,15 @@ class KaspiAdapter(MarketplaceAdapter):
 
             if not entry["price"]:
                 entry["price"] = self._extract_price(container, blob_text)
+            if not entry["seller"]:
+                seller_candidate = choose_first_non_empty(
+                    [
+                        first_text(container, ["[class*='seller']", "[data-testid*='seller']"]),
+                        extract_seller(blob_text),
+                    ]
+                )
+                if seller_candidate:
+                    entry["seller"] = seller_candidate
             if not entry["rating"]:
                 entry["rating"] = self._extract_rating(container, blob_text)
             if not entry["reviews_count"]:
@@ -343,6 +376,7 @@ class KaspiAdapter(MarketplaceAdapter):
                 continue
 
             price = entry["price"] if isinstance(entry["price"], str) else None
+            seller = entry["seller"] if isinstance(entry["seller"], str) else None
             if not price:
                 for blob in blob_texts:
                     parsed_price = format_price(blob)
@@ -363,6 +397,7 @@ class KaspiAdapter(MarketplaceAdapter):
                     title=title,
                     image_url=image_url,
                     price=price,
+                    seller=seller,
                     product_url=product_url,
                     rating=rating,
                     reviews_count=reviews_count,
@@ -377,6 +412,15 @@ class KaspiAdapter(MarketplaceAdapter):
             skipped_ads,
             skipped_title,
             skipped_missing_price,
+        )
+        self.last_search_total_found = extract_total_results_count(html)
+        self.last_search_sellers = sorted(
+            {
+                item.seller.strip()
+                for item in items
+                if isinstance(item.seller, str) and item.seller.strip()
+            },
+            key=str.lower,
         )
         if not items:
             logger.warning("Kaspi parser found no relevant product cards")

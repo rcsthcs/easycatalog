@@ -13,6 +13,8 @@ from app.adapters.common import (
     detect_antibot_challenge,
     extract_product_jsonld,
     extract_reviews_count,
+    extract_seller,
+    extract_total_results_count,
     first_attr,
     first_text,
     format_price,
@@ -53,6 +55,8 @@ class WildberriesAdapter(MarketplaceAdapter):
     def __init__(self, client: RequestClient):
         self.client = client
         self.last_block_reason: str | None = None
+        self.last_search_total_found: int | None = None
+        self.last_search_sellers: list[str] = []
 
     @staticmethod
     def _resolve_device_profile() -> str:
@@ -65,6 +69,8 @@ class WildberriesAdapter(MarketplaceAdapter):
         url = f"{self.base_url}/catalog/0/search.aspx?search={quote_plus(query)}"
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
+        self.last_search_total_found = None
+        self.last_search_sellers = []
 
         cards = await self._search_with_selenium(
             url=url,
@@ -353,6 +359,21 @@ class WildberriesAdapter(MarketplaceAdapter):
             rating = self._extract_rating(container, blob_text)
             reviews_count = self._extract_reviews(container, blob_text)
             image_url = self._extract_image(container or link)
+            seller = choose_first_non_empty(
+                [
+                    first_text(
+                        container,
+                        [
+                            "[class*='seller']",
+                            "[class*='brand']",
+                            "[data-testid*='seller']",
+                        ],
+                    )
+                    if container
+                    else None,
+                    extract_seller(blob_text),
+                ]
+            )
 
             seen.add(product_url)
             items.append(
@@ -361,6 +382,7 @@ class WildberriesAdapter(MarketplaceAdapter):
                     title=title,
                     image_url=image_url,
                     price=price,
+                    seller=seller,
                     product_url=product_url,
                     rating=rating,
                     reviews_count=reviews_count,
@@ -375,6 +397,15 @@ class WildberriesAdapter(MarketplaceAdapter):
             skipped_ads,
             skipped_title,
             skipped_missing_price,
+        )
+        self.last_search_total_found = extract_total_results_count(html)
+        self.last_search_sellers = sorted(
+            {
+                item.seller.strip()
+                for item in items
+                if isinstance(item.seller, str) and item.seller.strip()
+            },
+            key=str.lower,
         )
         if not items:
             logger.warning("Wildberries parser found no relevant product cards")

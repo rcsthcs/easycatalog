@@ -14,11 +14,13 @@ from app.adapters.common import (
     detect_antibot_challenge,
     extract_product_jsonld,
     extract_reviews_count,
+    extract_seller,
     first_attr,
     first_text,
     format_price,
     format_rating,
     gather_key_value,
+    extract_total_results_count,
     log_block_event,
     looks_like_banner_or_ad,
     looks_like_product_title,
@@ -49,6 +51,8 @@ class OzonAdapter(MarketplaceAdapter):
     def __init__(self, client: RequestClient):
         self.client = client
         self.last_block_reason: str | None = None
+        self.last_search_total_found: int | None = None
+        self.last_search_sellers: list[str] = []
 
     @staticmethod
     def _resolve_device_profile() -> str:
@@ -62,7 +66,58 @@ class OzonAdapter(MarketplaceAdapter):
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
         self.last_block_reason = None
+        self.last_search_total_found = None
+        self.last_search_sellers = []
 
+        apify_api_key = settings.apify_api_key.strip()
+        if apify_api_key:
+            logger.info("Using Apify directly for Ozon search: %s", url)
+            try:
+                from apify_client import ApifyClientAsync
+                client = ApifyClientAsync(apify_api_key)
+                run_input = {
+                    "startUrls": [{"url": url}],
+                    "maxItems": limit,  # many actors respect this
+                }
+                run = await client.actor(settings.apify_ozon_actor_id).call(run_input=run_input)
+                dataset = await client.dataset(run["defaultDatasetId"]).list_items()
+                
+                apify_cards = []
+                for item in dataset.items:
+                    title = item.get("title") or item.get("name") or ""
+                    if not title:
+                        continue
+                    
+                    price_raw = str(item.get("cardPrice") or item.get("price") or item.get("originalPrice") or "")
+                    if price_raw and "₽" not in price_raw:
+                        price_raw = str(price_raw).replace("\u2009", "").replace(" ", "").strip() + " ₽"
+
+                    image_url = item.get("images", [None])[0] if item.get("images") else item.get("image")
+                    product_url = item.get("url") or item.get("productUrl") or ""
+                    seller = item.get("seller") or item.get("brand") or "Ozon"
+                    rating = str(item.get("rating") or "")
+                    reviews_count = str(item.get("reviewCount") or item.get("reviewsCount") or "")
+                    
+                    apify_cards.append(ProductCard(
+                        source=self.source,
+                        title=title,
+                        image_url=image_url or "",
+                        price=price_raw,
+                        seller=seller,
+                        product_url=product_url,
+                        rating=rating,
+                        reviews_count=reviews_count,
+                    ))
+                
+                if apify_cards:
+                    # Fake total found based on what we got, Apify doesn't always provide stats
+                    self.last_search_total_found = len(apify_cards) 
+                    self.last_search_sellers = sorted(list({c.seller.strip() for c in apify_cards if c.seller and c.seller.strip()}), key=str.lower)
+                    return apify_cards[:limit]
+            except Exception as exc:
+                logger.warning("Ozon Apify search failed, falling back: %s", exc)
+
+        logger.info("Falling back to Selenium for Ozon search")
         try:
             cards = await self._search_with_selenium(
                 url=url,
@@ -98,7 +153,10 @@ class OzonAdapter(MarketplaceAdapter):
     async def get_product_details(self, product_url: str) -> ProductDetail:
         full_url = urljoin(self.base_url, product_url)
         apify_api_key = settings.apify_api_key.strip()
+        apify_error: Exception | None = None
+        apify_attempted = False
         if apify_api_key:
+            apify_attempted = True
             try:
                 from apify_client import ApifyClientAsync
 
@@ -172,10 +230,18 @@ class OzonAdapter(MarketplaceAdapter):
                             description=description,
                             characteristics=attributes,
                         )
+                apify_error = RuntimeError("Apify returned no usable Ozon detail item")
             except Exception as exc:
+                apify_error = exc
                 logger.warning("Apify failed, falling back to original code: %s", exc)
         else:
             logger.info("APIFY_API_KEY is empty, skipping Apify for Ozon detail")
+
+        if not settings.enable_playwright_fallback:
+            if apify_attempted:
+                reason = str(apify_error) if apify_error else "Apify did not return product details"
+                raise RuntimeError(f"Ozon detail fallback disabled; Apify failed: {reason}")
+            raise RuntimeError("Ozon detail fallback disabled and APIFY_API_KEY is empty")
 
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
@@ -354,6 +420,22 @@ class OzonAdapter(MarketplaceAdapter):
             rating = self._extract_rating(container, blob_text)
             reviews_count = self._extract_reviews(container, blob_text)
             image_url = self._extract_image(container or link)
+            seller = choose_first_non_empty(
+                [
+                    first_text(
+                        container,
+                        [
+                            "[class*='seller']",
+                            "[class*='shop']",
+                            "[data-widget*='seller']",
+                            "[data-testid*='seller']",
+                        ],
+                    )
+                    if container
+                    else None,
+                    extract_seller(blob_text),
+                ]
+            )
 
             seen.add(product_url)
             items.append(
@@ -362,6 +444,7 @@ class OzonAdapter(MarketplaceAdapter):
                     title=title,
                     image_url=image_url,
                     price=price,
+                    seller=seller,
                     product_url=product_url,
                     rating=rating,
                     reviews_count=reviews_count,
@@ -377,10 +460,60 @@ class OzonAdapter(MarketplaceAdapter):
             skipped_title,
             skipped_missing_price,
         )
+        self.last_search_total_found = self._extract_ozon_total(html)
+        self.last_search_sellers = sorted(
+            {
+                item.seller.strip()
+                for item in items
+                if isinstance(item.seller, str) and item.seller.strip()
+            },
+            key=str.lower,
+        )
         if not items:
             logger.warning("Ozon parser found no relevant product cards")
 
+        logger.info("Ozon total_found=%s for query", self.last_search_total_found)
         return items
+
+    @staticmethod
+    def _extract_ozon_total(html: str) -> int | None:
+        """Extract total product count from Ozon's rendered HTML.
+
+        Ozon embeds its state in several forms:
+        - JSON script tags with keys like totalFound / total / catalogTotal
+        - Text like "12 345 товаров"
+        """
+        import re as _re
+
+        # Priority 1: Ozon-specific JSON keys in script tags
+        ozon_patterns = [
+            _re.compile(r'"totalFound"\s*:\s*(\d{1,12})'),
+            _re.compile(r'"foundCount"\s*:\s*(\d{1,12})'),
+            _re.compile(r'"total"\s*:\s*(\d{1,12})'),
+            _re.compile(r'"catalogTotal"\s*:\s*(\d{1,12})'),
+            _re.compile(r'"paginationTotal"\s*:\s*(\d{1,12})'),
+            _re.compile(r'"totalCount"\s*:\s*(\d{1,12})'),
+            _re.compile(r'"itemsTotal"\s*:\s*(\d{1,12})'),
+        ]
+
+        candidates: list[int] = []
+
+        for pattern in ozon_patterns:
+            for m in pattern.finditer(html):
+                value = int(m.group(1))
+                if 1 <= value <= 50_000_000:
+                    candidates.append(value)
+
+        if candidates:
+            # Use the max plausible value
+            result = max(candidates)
+            logger.debug("Ozon total from JSON patterns: %s (candidates: %s)", result, candidates[:5])
+            return result
+
+        # Priority 2: Fallback to generic extractor
+        from app.adapters.common import extract_total_results_count
+        return extract_total_results_count(html)
+
 
     def _parse_detail(self, html: str, full_url: str) -> ProductDetail:
         soup = BeautifulSoup(html, "html.parser")
